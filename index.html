@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Switch Panel</title>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; background: #f0f2f5; text-align: center; padding-top: 50px; }
+        .card { background: white; width: 300px; margin: 0 auto; padding: 20px; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        input { width: 80%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
+        button { width: 90%; padding: 12px; margin: 5px 0; cursor: pointer; border: none; border-radius: 5px; font-weight: bold; }
+        .btn-auth { background: #007bff; color: white; }
+        .btn-on { background: #28a745; color: white; }
+        .btn-off { background: #dc3545; color: white; }
+        #control-section { display: none; } /* 초기엔 숨김 */
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>스마트 스위치</h2>
+
+    <div id="login-section">
+        <form onsubmit="event.preventDefault(); authAndFetchStatus();">
+            <input type="text" value="admin" style="display:none;" autocomplete="username">
+            <input type="password" id="pwd-input" placeholder="비밀번호 입력" autocomplete="current-password" required="">
+            <button type="submit" class="btn-auth">접속 및 상태 확인</button>
+        </form>
+    </div>
+
+    <div id="control-section">
+        <p>현재 상태: <strong id="status-text">-</strong></p>
+        <button class="btn-on" onclick="sendCommand('ON')">전등 켜기</button>
+        <button class="btn-off" onclick="sendCommand('OFF')">전등 끄기</button>
+        <button onclick="location.reload()" style="background:none; color:#777; font-size:12px;">로그아웃</button>
+    </div>
+</div>
+
+<script>
+    const DEVICE_ID = "switch_01";
+
+    // 시간 포맷 생성 (YYYY-MM-DD-HH:mm)
+    function getTimeStr() {
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}-${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    }
+
+    // 1. 인증 및 상태 가져오기 (해시 제거, password 직접 전송)
+    async function authAndFetchStatus() {
+        const time = getTimeStr();
+        const pwd = document.getElementById('pwd-input').value;
+
+        try {
+            const resp = await fetch('/api/get_status', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                // 서버 코드가 password를 요구하도록 수정되었으므로 맞춰줍니다.
+                body: JSON.stringify({ request_time: time, password: pwd }) 
+            });
+            const res = await resp.json();
+
+            if(resp.ok) {
+                document.getElementById('status-text').innerText = res.current_state;
+                document.getElementById('login-section').style.display = 'none';
+                document.getElementById('control-section').style.display = 'block';
+            } else { alert(res.message); }
+        } catch(e) { alert("서버 연결 실패"); }
+    }
+
+    // 2. 명령 전송 (해시 제거, password 직접 전송)
+    async function sendCommand(cmd) {
+        const time = getTimeStr();
+        const pwd = document.getElementById('pwd-input').value;
+
+        try {
+            const resp = await fetch('/api/control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    request_time: time, 
+                    password: pwd, 
+                    command: cmd, 
+                    device_id: DEVICE_ID
+                })
+            });
+            const res = await resp.json();
+            if(resp.ok) {
+                document.getElementById('status-text').innerText = cmd;
+                alert(res.message);
+            } else { alert(res.message); }
+        } catch(e) { alert("서버 연결 실패"); }
+    }
+</script>
+
+</body>
+</html>
