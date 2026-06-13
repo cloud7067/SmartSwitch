@@ -1,147 +1,397 @@
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
 
-// [설정 1] 사용하는 와이파이 이름과 비밀번호
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+// ================= [네트워크 설정 및 변수] =================
+const char* ssid = "ssidssid";          // 본인 와이파이 이름
+const char* password = "12345678";  // 본인 와이파이 비밀번호
+String flaskServerUrl = "http://192.168.0.1:5000"; // 본인 플라스크 서버 주소
 
-// [설정 2] 홈서버(파이썬)가 실행 중인 PC의 내부 IP 주소 및 포트
-// 주의: http:// 는 빼고 적습니다. (예: "192.168.0.10:5000")
-String serverIP = "192.168.0.x:5000"; 
+// ================= [핀 설정] =================
+#define TOUCH_PIN 20
+#define RELAY_PIN 21
+#define RED_PIN 5
+#define GREEN_PIN 6
+#define BLUE_PIN 7
 
-// 8번 핀을 제어 핀(내장 LED 등)으로 설정
-const int LED_PIN = 8;
-
-// ESP32 자체 웹서버를 80번 포트로 개방
+// ================= [전역 변수] =================
 WebServer server(80);
 
-// 현재 스위치 상태 저장
-String current_status = "OFF";
+volatile bool lightState = false;
 
-// 하트비트(생존 신고) 타이머용 변수
-unsigned long lastHeartbeat = 0;
-const unsigned long HEARTBEAT_INTERVAL = 120000; // 120초 (2분)
+// 터치 관련
+volatile bool touchTriggered = false;
 
-// 함수 선언
+unsigned long lastTouchTime = 0;
+unsigned long lastRelayToggleTime = 0;
+
+// 서버 전송 관련
+bool needToSendChange = false;
+
+unsigned long lastHeartbeatTime = 0;
+const unsigned long HEARTBEAT_INTERVAL = 30000;
+
+// ================= [비동기 네트워크 Task 변수] =================
+volatile bool sendRequestFlag = false;
+String pendingEndpoint = "";
+
+// ================= [함수 선언] =================
+void setRGB(int r, int g, int b);
+void updateStatusLED();
+void setLightState(bool state);
+void sendStatusToServer(String endpoint);
+String getFormattedTime();
 void handleServerCommand();
-void sendToServer(String endpoint, String triggerInfo);
+void networkTask(void * parameter);
 
+// ================= [터치 인터럽트] =================
+void IRAM_ATTR onTouchISR() {
+  touchTriggered = true;
+}
+
+// ================= [SETUP] =================
 void setup() {
+
   Serial.begin(115200);
 
-  // 1. LED 핀 초기화
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // 시작할 때는 OFF 상태
+  pinMode(TOUCH_PIN, INPUT);
 
-  // 2. 와이파이 연결
-  Serial.print("\nConnecting to WiFi");
+  pinMode(RELAY_PIN, OUTPUT);
+
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BLUE_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, LOW);
+
+  setRGB(255, 0, 0);
+
+  // 인터럽트 등록
+  attachInterrupt(
+    digitalPinToInterrupt(TOUCH_PIN),
+    onTouchISR,
+    RISING
+  );
+
+  // ================= WIFI 연결 =================
+  Serial.print("WiFi 연결 중...");
+
   WiFi.begin(ssid, password);
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi Connected!");
-  Serial.print("ESP32 IP Address: ");
-  Serial.println(WiFi.localIP()); 
-  // ↑ 이 IP 주소를 파이썬 코드의 ESP32_IP 변수에 적어주면 됩니다.
 
-  // 3. 서버로부터 명령을 받을 주소(/api/command) 라우팅
-  server.on("/api/command", HTTP_POST, handleServerCommand);
-  
-  // 4. ESP32 서버 시작
+  Serial.println();
+  Serial.println("WiFi 연결 완료!");
+
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // ================= 시간 동기화 =================
+  configTime(
+    9 * 3600,
+    0,
+    "pool.ntp.org",
+    "time.nist.gov"
+  );
+
+  // ================= 웹서버 =================
+  server.on(
+    "/api/command",
+    HTTP_POST,
+    handleServerCommand
+  );
+
   server.begin();
-  Serial.println("ESP32 Server Started.");
+
+  // ================= 네트워크 Task 생성 =================
+  xTaskCreatePinnedToCore(
+    networkTask,      // 함수
+    "NetworkTask",    // 이름
+    10000,            // stack size
+    NULL,
+    1,
+    NULL,
+    0                 // Core0
+  );
+
+  updateStatusLED();
+
+  // 최초 상태 보고
+  pendingEndpoint = "/api/change";
+  sendRequestFlag = true;
 }
 
+// ================= [LOOP] =================
 void loop() {
-  // 웹 요청이 들어오는지 계속 확인
+
+  updateStatusLED();
+
+  // 웹서버 처리
   server.handleClient();
 
-  // 주기적 하트비트 전송 (2분마다 서버에 생존 신고)
-  if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
-    lastHeartbeat = millis();
-    sendToServer("/api/state", "heartbeat");
+  // ================= 터치 처리 =================
+  if (touchTriggered) {
+    touchTriggered = false;
+
+    // 100ms 동안 10ms 간격으로 핀 상태를 샘플링합니다.
+    int highCount = 0;
+    for (int i = 0; i < 10; i++) {
+      if (digitalRead(TOUCH_PIN) == HIGH) {
+        highCount++;
+      }
+      delay(10);
+    }
+
+    // 100ms 중 최소 80%(8번 이상) 동안 HIGH가 유지되었다면 진짜 사람이 누른 것입니다
+    if (highCount > 8) {
+      if (millis() - lastTouchTime > 300) { // 터치 간격 디바운스도 500ms로 상향
+        lastTouchTime = millis();
+        setLightState(!lightState);
+        lastRelayToggleTime = millis();
+        needToSendChange = true;
+      }
+    }
+  }
+
+  // ================= 상태 변경 보고 =================
+  if (
+    needToSendChange &&
+    millis() - lastRelayToggleTime > 1000
+  ) {
+
+    needToSendChange = false;
+
+    pendingEndpoint = "/api/change";
+    sendRequestFlag = true;
+  }
+
+  // ================= heartbeat =================
+  if (
+    millis() - lastHeartbeatTime >
+    HEARTBEAT_INTERVAL
+  ) {
+
+    lastHeartbeatTime = millis();
+
+    if (!needToSendChange) {
+
+      pendingEndpoint = "/api/state";
+      sendRequestFlag = true;
+    }
+  }
+
+  delay(1);
+}
+
+// ================= [비동기 네트워크 Task] =================
+void networkTask(void * parameter) {
+
+  while (true) {
+
+    if (sendRequestFlag) {
+
+      sendRequestFlag = false;
+
+      if (WiFi.status() == WL_CONNECTED) {
+
+        sendStatusToServer(pendingEndpoint);
+      }
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
-// ==========================================
-// [수신] 홈서버 -> ESP32 명령 수신 시 실행
-// ==========================================
-void handleServerCommand() {
-  if (!server.hasArg("plain")) {
-    server.send(400, "text/plain", "Bad Request");
+// ================= [RGB LED] =================
+void setRGB(int r, int g, int b) {
+
+  analogWrite(RED_PIN, r);
+  analogWrite(GREEN_PIN, g);
+  analogWrite(BLUE_PIN, b);
+}
+
+// ================= [상태 LED 업데이트] =================
+void updateStatusLED() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    setRGB(255, 0, 0);
+
+  } else if (lightState) {
+
+    setRGB(255, 255, 255);
+
+  } else {
+
+    setRGB(0, 0, 255);
+  }
+}
+
+// ================= [릴레이 제어] =================
+void setLightState(bool state) {
+
+  lightState = state;
+
+  digitalWrite(
+    RELAY_PIN,
+    lightState ? HIGH : LOW
+  );
+
+  updateStatusLED();
+
+  Serial.println(
+    lightState ? "전등 ON" : "전등 OFF"
+  );
+}
+
+// ================= [시간 문자열 생성] =================
+String getFormattedTime() {
+
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo)) {
+
+    return "2000-01-01-00:00";
+  }
+
+  char timeStringBuff[50];
+
+  strftime(
+    timeStringBuff,
+    sizeof(timeStringBuff),
+    "%Y-%m-%d-%H:%M",
+    &timeinfo
+  );
+
+  return String(timeStringBuff);
+}
+
+// ================= [서버 전송] =================
+void sendStatusToServer(String endpoint) {
+
+  WiFiClient client;
+
+  HTTPClient http;
+
+  // timeout 줄이기
+  http.setTimeout(500);
+
+  // keep-alive
+  http.setReuse(true);
+
+  String fullUrl = flaskServerUrl + endpoint;
+
+  Serial.print("POST: ");
+  Serial.println(fullUrl);
+
+  if (!http.begin(client, fullUrl)) {
+
+    Serial.println("HTTP begin 실패");
+
     return;
   }
-  
-  String payload = server.arg("plain");
-  Serial.println("\n[수신] 서버 명령 도착: " + payload);
 
-  // JSON 데이터 파싱
-  StaticJsonDocument<256> doc;
-  DeserializationError error = deserializeJson(doc, payload);
+  http.addHeader(
+    "Content-Type",
+    "application/json"
+  );
+
+  StaticJsonDocument<200> doc;
+
+  doc["request_time"] = getFormattedTime();
+
+  doc["status"] =
+    lightState ? "ON" : "OFF";
+
+  doc["device_id"] =
+    "esp32_room_light";
+
+  String requestBody;
+
+  serializeJson(doc, requestBody);
+
+  int httpResponseCode =
+    http.POST(requestBody);
+
+  if (httpResponseCode > 0) {
+
+    Serial.printf(
+      "전송 성공 (%s): %d\n",
+      endpoint.c_str(),
+      httpResponseCode
+    );
+
+  } else {
+
+    Serial.printf(
+      "전송 실패: %s\n",
+      http.errorToString(
+        httpResponseCode
+      ).c_str()
+    );
+  }
+
+  http.end();
+}
+
+// ================= [플라스크 명령 수신] =================
+void handleServerCommand() {
+
+  if (!server.hasArg("plain")) {
+
+    server.send(
+      400,
+      "application/json",
+      "{\"status\":\"error\",\"message\":\"Body not found\"}"
+    );
+
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  StaticJsonDocument<200> doc;
+
+  DeserializationError error =
+    deserializeJson(doc, body);
 
   if (error) {
-    Serial.println("JSON 파싱 에러");
-    server.send(400, "application/json", "{\"status\":\"error\"}");
+
+    server.send(
+      400,
+      "application/json",
+      "{\"status\":\"error\",\"message\":\"JSON parsing failed\"}"
+    );
+
     return;
   }
 
-  // 명령 확인 (ON / OFF)
-  String cmd = doc["command"]; 
-  
-  // 8번 핀 조작 및 상태 변경
-  if (cmd == "ON") {
-    current_status = "ON";
-    digitalWrite(LED_PIN, HIGH);
-    Serial.println("💡 8번 핀 ON");
-  } else if (cmd == "OFF") {
-    current_status = "OFF";
-    digitalWrite(LED_PIN, LOW);
-    Serial.println("⚫ 8번 핀 OFF");
+  String command = doc["command"];
+
+  if (command == "ON" && !lightState) {
+
+    setLightState(true);
+
+  } else if (
+    command == "OFF" &&
+    lightState
+  ) {
+
+    setLightState(false);
+
+  } else if (command == "TOGGLE") {
+
+    setLightState(!lightState);
   }
 
-  // 1. "명령 잘 받았음!" 이라고 파이썬 서버에 응답
-  server.send(200, "application/json", "{\"result\":\"success\"}");
-  
-  // 2. 상태가 변했으므로 긴급 보고용 주소로 전송
-  sendToServer("/api/change", "web_command");
-}
-
-// ==========================================
-// [발신] ESP32 -> 홈서버 상태 보고
-// ==========================================
-void sendToServer(String endpoint, String triggerInfo) {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    // 목적지 URL 만들기 (예: http://192.168.0.10:5000/api/change)
-    String url = "http://" + serverIP + endpoint;
-    
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-
-    // 보낼 JSON 데이터 조립
-    StaticJsonDocument<256> doc;
-    doc["request_time"] = "ESP32"; // 시간 검증은 어차피 파이썬이 하므로 더미 데이터 삽입
-    doc["status"] = current_status;
-    doc["device_id"] = "switch_01";
-    doc["trigger"] = triggerInfo;
-
-    String jsonOutput;
-    serializeJson(doc, jsonOutput);
-
-    // POST 전송
-    int httpResponseCode = http.POST(jsonOutput);
-    
-    if (httpResponseCode > 0) {
-      Serial.print("[발신] " + endpoint + " 성공 (코드: " + String(httpResponseCode) + ")\n");
-    } else {
-      Serial.print("[발신] " + endpoint + " 실패: " + http.errorToString(httpResponseCode) + "\n");
-    }
-    
-    http.end();
-  } else {
-    Serial.println("WiFi 연결 끊김");
-  }
+  server.send(
+    200,
+    "application/json",
+    "{\"status\":\"success\"}"
+  );
 }
